@@ -1,15 +1,18 @@
 package task
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/52poke/timburr/utils"
 	"github.com/cloudflare/cloudflare-go"
-	"github.com/mudkipme/timburr/utils"
-	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 )
 
 // PurgeExecutor purges the front-end cache by URLs
@@ -34,7 +37,7 @@ func DefaultPurgeExecutor() *PurgeExecutor {
 	if utils.Config.Purge.CFToken != "" {
 		cfAPI, err = cloudflare.NewWithAPIToken(utils.Config.Purge.CFToken)
 		if err != nil {
-			log.WithError(err).Error("cloudflare api invalid")
+			slog.Error("cloudflare api invalid", "err", err)
 		}
 	}
 	return NewPurgeExecutor(
@@ -59,7 +62,7 @@ func NewPurgeExecutor(expiry time.Duration, entries []utils.PurgeEntryConfig, cf
 }
 
 // Execute sends the corresponding PURGE requests from a kafka message
-func (t *PurgeExecutor) Execute(message []byte) error {
+func (t *PurgeExecutor) Execute(ctx context.Context, message []byte) error {
 	type purgeData struct {
 		Meta struct {
 			URI  string    `json:"uri"`
@@ -74,15 +77,15 @@ func (t *PurgeExecutor) Execute(message []byte) error {
 
 	// skip expired message
 	if time.Now().After(msg.Meta.Date.Add(t.expiry)) {
-		log.WithField("url", msg.Meta.URI).Info("skip purge")
+		slog.Info("skip purge", "url", msg.Meta.URI)
 		return nil
 	}
 
-	t.handlePurge(msg.Meta.URI)
+	t.handlePurge(ctx, msg.Meta.URI, msg.Meta.Date)
 	return nil
 }
 
-func (t *PurgeExecutor) handlePurge(item string) {
+func (t *PurgeExecutor) handlePurge(ctx context.Context, item string, date time.Time) {
 	ros := []requestOptions{}
 	u, err := url.Parse(item)
 	if err != nil {
@@ -102,6 +105,16 @@ func (t *PurgeExecutor) handlePurge(item string) {
 	for _, entry := range t.entries {
 		if entry.Host != u.Host {
 			continue
+		}
+		if entry.PathMatch != "" {
+			match, err := regexp.MatchString(entry.PathMatch, u.Path)
+			if err != nil {
+				slog.Warn("invalid pathMatch regex", "host", entry.Host, "pathMatch", entry.PathMatch, "err", err)
+				continue
+			}
+			if !match {
+				continue
+			}
 		}
 		variants := make(map[string]bool)
 		variants[""] = true
@@ -133,63 +146,69 @@ func (t *PurgeExecutor) handlePurge(item string) {
 	}
 
 	ros = uniq(ros)
-	ch := make(chan bool)
+	eg, egCtx := errgroup.WithContext(ctx)
+	dateStr := date.Format(time.RFC3339)
 	for _, ro := range ros {
-		go t.doRequest(ro.method, ro.url, ro.headers, ch)
+		ro := ro
+		eg.Go(func() error {
+			return t.doRequest(egCtx, ro.method, ro.url, ro.headers, item, dateStr)
+		})
 	}
-	for range ros {
-		<-ch
+	if err := eg.Wait(); err != nil {
+		slog.Warn("purge request failed", "err", err)
 	}
 }
 
-func (t *PurgeExecutor) doRequest(method, url string, headers map[string]string, ch chan bool) {
+func (t *PurgeExecutor) doRequest(ctx context.Context, method, url string, headers map[string]string, rawURL, dateStr string) error {
 	if strings.ToLower(method) == "cloudflare" {
-		t.doCloudFlarePurge(url, ch)
-		return
+		return t.doCloudFlarePurge(ctx, url)
 	}
-	req, err := http.NewRequest(method, url, nil)
+	ctx, cancel := context.WithTimeout(ctx, t.client.Timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
-		log.WithError(err).WithField("url", url).Warn("failed to send purge request")
-		ch <- false
-		return
+		slog.Warn("failed to send purge request", "url", url, "err", err)
+		return err
 	}
 	for k, v := range headers {
-		req.Header.Set(k, v)
+		value := strings.ReplaceAll(v, "#url#", rawURL)
+		value = strings.ReplaceAll(value, "#date#", dateStr)
+		req.Header.Set(k, value)
 	}
 	if host := req.Header.Get("Host"); host != "" {
 		req.Host = host
 	}
 	response, err := t.client.Do(req)
 	if err != nil {
-		log.WithError(err).WithField("url", url).Warn("failed to send purge request")
-		ch <- false
-		return
+		slog.Warn("failed to send purge request", "url", url, "err", err)
+		return err
 	}
 	response.Body.Close()
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
-		log.WithField("url", url).Info("purge success")
-	} else if response.StatusCode != http.StatusNotFound && response.StatusCode >= 300 {
-		log.WithField("statusCode", response.StatusCode).WithField("url", url).Warn("failed to send purge request")
+		slog.Info("purge success", "url", url)
+	} else if response.StatusCode != http.StatusNotFound && response.StatusCode != http.StatusBadRequest && response.StatusCode >= 300 {
+		slog.Warn("failed to send purge request", "url", url, "statusCode", response.StatusCode)
 	}
-	ch <- true
+	return nil
 }
 
-func (t *PurgeExecutor) doCloudFlarePurge(url string, ch chan bool) {
+func (t *PurgeExecutor) doCloudFlarePurge(ctx context.Context, url string) error {
 	if t.cfAPI == nil {
-		log.WithField("url", url).Warn("failed to purge cloudflare cache")
-		ch <- false
-		return
+		slog.Warn("failed to purge cloudflare cache", "url", url)
+		return nil
 	}
-	resp, err := t.cfAPI.PurgeCache(t.cfZoneID, cloudflare.PurgeCacheRequest{
+	ctx, cancel := context.WithTimeout(ctx, t.client.Timeout)
+	defer cancel()
+	resp, err := t.cfAPI.PurgeCache(ctx, t.cfZoneID, cloudflare.PurgeCacheRequest{
 		Files: []string{url},
 	})
 	if err != nil {
-		log.WithError(err).WithField("url", url).Warn("failed to purge cloudflare cache")
-		ch <- false
-		return
+		slog.Warn("failed to purge cloudflare cache", "url", url, "err", err)
+		return err
 	}
-	log.WithField("url", url).WithField("response", resp).Info("purge success")
-	ch <- true
+	slog.Info("purge success", "url", url, "response", resp)
+	return nil
 }
 
 func uniq(input []requestOptions) (res []requestOptions) {

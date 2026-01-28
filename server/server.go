@@ -1,12 +1,16 @@
 package server
 
 import (
-	"io/ioutil"
+	"context"
+	"io"
+	"log/slog"
 	"net/http"
+	"time"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/segmentio/kafka-go"
 	"github.com/tidwall/gjson"
-	"gopkg.in/confluentinc/confluent-kafka-go.v1/kafka"
+
+	"github.com/52poke/timburr/utils"
 )
 
 type ServerConfig struct {
@@ -17,7 +21,7 @@ type ServerConfig struct {
 }
 
 type TimburrServer struct {
-	producer *kafka.Producer
+	producer *kafka.Writer
 	server   *http.Server
 	config   *ServerConfig
 }
@@ -33,13 +37,11 @@ func NewTimburrServer(config *ServerConfig) (*TimburrServer, error) {
 }
 
 func (s *TimburrServer) setup() error {
-	p, err := kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers": s.config.BrokerList,
+	brokers := utils.SplitBrokers(s.config.BrokerList)
+	s.producer = kafka.NewWriter(kafka.WriterConfig{
+		Brokers:  brokers,
+		Balancer: &kafka.LeastBytes{},
 	})
-	if err != nil {
-		return err
-	}
-	s.producer = p
 
 	s.server = &http.Server{Addr: s.config.Listen, Handler: s}
 	return nil
@@ -51,25 +53,16 @@ func (s *TimburrServer) sendMessage(data gjson.Result) error {
 		topic = s.config.DefaultTopic
 	}
 
-	deliveryChan := make(chan kafka.Event, 1)
-	err := s.producer.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
-		Value:          []byte(data.Raw),
-	}, deliveryChan)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := s.producer.WriteMessages(ctx, kafka.Message{
+		Topic: topic,
+		Value: []byte(data.Raw),
+	})
 	if err != nil {
-		log.WithError(err).Warn("http produce error")
-		return err
+		slog.Warn("http produce error", "err", err)
 	}
-
-	e := <-deliveryChan
-	m := e.(*kafka.Message)
-	if m.TopicPartition.Error != nil {
-		log.WithError(err).Warn("http produce error")
-		close(deliveryChan)
-		return err
-	}
-	close(deliveryChan)
-	return nil
+	return err
 }
 
 func (s *TimburrServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -77,7 +70,7 @@ func (s *TimburrServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	body, err := ioutil.ReadAll(req.Body)
+	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte("read request failed"))
@@ -108,12 +101,13 @@ func (s *TimburrServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *TimburrServer) Start() error {
-	log.Infof("server start at %s", s.config.Listen)
+	slog.Info("server start", "listen", s.config.Listen)
 	return s.server.ListenAndServe()
 }
 
 func (s *TimburrServer) Close() error {
-	s.producer.Flush(10000)
-	s.producer.Close()
+	if err := s.producer.Close(); err != nil {
+		return err
+	}
 	return s.server.Close()
 }

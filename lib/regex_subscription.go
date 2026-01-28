@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mudkipme/timburr/utils"
+	"github.com/52poke/timburr/utils"
 )
 
 // RegexSubscription can subscribe to topics matching regular expression, and watch for changes of topics
@@ -80,10 +80,10 @@ func (sub *RegexSubscription) resubscribe(topics []string) error {
 	}
 
 	newRule := utils.RuleConfig{
-		Name:        sub.rule.Name,
-		Topics:      topics,
-		Filter:      sub.rule.Filter,
-		TaskType:    sub.rule.TaskType,
+		Name:     sub.rule.Name,
+		Topics:   topics,
+		Filter:   sub.rule.Filter,
+		TaskType: sub.rule.TaskType,
 	}
 	sub.subscription = &BasicSubscription{
 		config: sub.config,

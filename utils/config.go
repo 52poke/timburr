@@ -18,11 +18,12 @@ type RuleConfig struct {
 
 // PurgeEntryConfig defines how to generate purge requests for different hosts
 type PurgeEntryConfig struct {
-	Host     string            `yaml:"host"`
-	Method   string            `yaml:"method"`
-	URIs     []string          `yaml:"uris"`
-	Headers  map[string]string `yaml:"headers"`
-	Variants []string          `toml:"variants"`
+	Host      string            `yaml:"host"`
+	PathMatch string            `yaml:"pathMatch"`
+	Method    string            `yaml:"method"`
+	URIs      []string          `yaml:"uris"`
+	Headers   map[string]string `yaml:"headers"`
+	Variants  []string          `toml:"variants"`
 }
 
 // Config is the configuration of timburr
@@ -33,7 +34,6 @@ var Config = struct {
 
 	Options struct {
 		GroupIDPrefix                string `yaml:"groupIDPrefix"`
-		MetadataWatchGroupID         string `yaml:"metadataWatchGroupID"`
 		MetadataWatchRefreshInterval int64  `yaml:"metadataWatchRefreshInterval"`
 		Listen                       string `yaml:"listen"`
 		TopicKey                     string `yaml:"topicKey"`

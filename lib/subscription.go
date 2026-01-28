@@ -1,7 +1,7 @@
 package lib
 
 import (
-	"github.com/mudkipme/timburr/utils"
+	"github.com/52poke/timburr/utils"
 )
 
 // SubscriptionConfig is the configuration for all subscriptions

@@ -1,14 +1,16 @@
 package lib
 
 import (
+	"context"
+	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
-	rate "github.com/beefsack/go-rate"
-	"github.com/mudkipme/timburr/lib/task"
-	"github.com/mudkipme/timburr/utils"
-	log "github.com/sirupsen/logrus"
-	"gopkg.in/confluentinc/confluent-kafka-go.v1/kafka"
+	"github.com/52poke/timburr/lib/task"
+	"github.com/52poke/timburr/utils"
+	"github.com/segmentio/kafka-go"
+	"golang.org/x/time/rate"
 )
 
 // BasicSubscription can subscribe to kafka topics and handle task to task runner
@@ -16,10 +18,10 @@ type BasicSubscription struct {
 	config     *SubscriptionConfig
 	rule       utils.RuleConfig
 	mutex      sync.Mutex
-	consumer   *kafka.Consumer
+	reader     *kafka.Reader
 	subscribed bool
-	stopChan   chan bool
-	limiter    *rate.RateLimiter
+	cancel     context.CancelFunc
+	limiter    *rate.Limiter
 }
 
 func (sub *BasicSubscription) topics() []string {
@@ -34,80 +36,65 @@ func (sub *BasicSubscription) Subscribe() error {
 		return nil
 	}
 
-	var err error
-	sub.consumer, err = kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers": sub.config.BrokerList,
-		"group.id":          sub.config.GroupIDPrefix + sub.rule.Name,
-		"auto.offset.reset": "earliest",
-	})
-	if err != nil {
-		return err
-	}
 	topics := sub.topics()
-	err = sub.consumer.SubscribeTopics(topics, nil)
-	if err != nil {
-		return err
-	}
-	sub.stopChan = make(chan bool, 1)
+	sub.reader = kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     utils.SplitBrokers(sub.config.BrokerList),
+		GroupID:     sub.config.GroupIDPrefix + sub.rule.Name,
+		GroupTopics: topics,
+		StartOffset: kafka.FirstOffset,
+	})
 	sub.subscribed = true
 	if sub.rule.RateLimit > 0 {
 		if sub.rule.RateInterval == 0 {
 			sub.rule.RateInterval = 1000
 		}
-		sub.limiter = rate.New(sub.rule.RateLimit, time.Duration(sub.rule.RateInterval)*time.Millisecond)
+		interval := time.Duration(sub.rule.RateInterval) * time.Millisecond
+		limit := rate.Limit(float64(sub.rule.RateLimit) / interval.Seconds())
+		sub.limiter = rate.NewLimiter(limit, sub.rule.RateLimit)
 	}
-	go sub.consume()
-	log.Infof("subscribed to %v, rule: %v", topics, sub.rule.Name)
+	ctx, cancel := context.WithCancel(context.Background())
+	sub.cancel = cancel
+	go sub.consume(ctx)
+	slog.Info("subscribed to topics", "topics", topics, "rule", sub.rule.Name)
 	return nil
 }
 
-func (sub *BasicSubscription) consume() {
-	for sub.subscribed {
-		select {
-		case <-sub.stopChan:
-			sub.mutex.Lock()
-			sub.subscribed = false
-			sub.mutex.Unlock()
-			break
-		default:
-			ev := sub.consumer.Poll(100)
-			if ev == nil {
+func (sub *BasicSubscription) consume(ctx context.Context) {
+	for {
+		msg, err := sub.reader.FetchMessage(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			slog.Warn("consume message error", "err", err)
+			continue
+		}
+		if sub.limiter != nil {
+			if err := sub.limiter.Wait(ctx); err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				slog.Warn("rate limit wait error", "err", err)
 				continue
 			}
-			switch e := ev.(type) {
-			case *kafka.Message:
-				if sub.limiter != nil {
-					sub.limiter.Wait()
-				}
-				sub.mutex.Lock()
-				sub.handleMessage(e)
-				sub.mutex.Unlock()
-			case *kafka.Error:
-				if e.Code() == kafka.ErrAllBrokersDown {
-					log.WithError(e).Fatal("kafka all broker down")
-					sub.mutex.Lock()
-					sub.subscribed = false
-					sub.mutex.Unlock()
-				} else {
-					log.WithError(e).Warn("consume message error")
-				}
+		}
+		sub.mutex.Lock()
+		sub.handleMessage(ctx, msg.Value)
+		sub.mutex.Unlock()
+		if err := sub.reader.CommitMessages(ctx, msg); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
 			}
+			slog.Warn("commit message error", "err", err)
 		}
 	}
-	sub.mutex.Lock()
-	err := sub.consumer.Close()
-	if err != nil {
-		log.WithError(err).Warn("close consumer failed")
-	}
-	sub.stopChan = nil
-	sub.mutex.Unlock()
 }
 
-func (sub *BasicSubscription) handleMessage(km *kafka.Message) error {
+func (sub *BasicSubscription) handleMessage(ctx context.Context, km []byte) error {
 	executor := task.TypeFromString(sub.rule.TaskType).GetExecutor()
-	err := executor.Execute(km.Value)
+	err := executor.Execute(ctx, km)
 	if err != nil {
-		log.WithError(err).Warn("execute message error")
+		slog.Warn("execute message error", "err", err)
 	}
 	return err
 }
@@ -119,5 +106,15 @@ func (sub *BasicSubscription) Unsubscribe() {
 	if !sub.subscribed {
 		return
 	}
-	sub.stopChan <- true
+	sub.subscribed = false
+	if sub.cancel != nil {
+		sub.cancel()
+		sub.cancel = nil
+	}
+	if sub.reader != nil {
+		if err := sub.reader.Close(); err != nil {
+			slog.Warn("close reader failed", "err", err)
+		}
+		sub.reader = nil
+	}
 }

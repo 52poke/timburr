@@ -3,7 +3,7 @@ package lib
 import (
 	"regexp"
 
-	"github.com/mudkipme/timburr/utils"
+	"github.com/52poke/timburr/utils"
 )
 
 func ruleTopics(rule utils.RuleConfig) []string {

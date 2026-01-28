@@ -1,12 +1,13 @@
 package task
 
 import (
+	"context"
 	"sync"
 )
 
 // Executor can execute a certain from a kafka message
 type Executor interface {
-	Execute(message []byte) error
+	Execute(ctx context.Context, message []byte) error
 }
 
 // Type is an enum for task types

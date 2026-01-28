@@ -1,11 +1,13 @@
 package lib
 
 import (
+	"errors"
+	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-	"gopkg.in/confluentinc/confluent-kafka-go.v1/kafka"
+	"github.com/segmentio/kafka-go"
 )
 
 // MetadataWatcherEvent defines an event, it's either the topics in kafka changes, or an error occurs
@@ -18,15 +20,15 @@ type MetadataWatcherEvent struct {
 type MetadataWatcher struct {
 	mutex         sync.RWMutex
 	knownTopics   []string
-	consumer      *kafka.Consumer
+	brokers       []string
 	stopChan      chan bool
 	eventChannels []chan MetadataWatcherEvent
 }
 
-// NewMetadataWatcher creates a new metadata watcher with a kafka consumer
-func NewMetadataWatcher(consumer *kafka.Consumer, refreshInterval time.Duration) (*MetadataWatcher, error) {
+// NewMetadataWatcher creates a new metadata watcher with a broker list
+func NewMetadataWatcher(brokers []string, refreshInterval time.Duration) (*MetadataWatcher, error) {
 	watcher := &MetadataWatcher{
-		consumer:      consumer,
+		brokers:       brokers,
 		knownTopics:   []string{},
 		eventChannels: []chan MetadataWatcherEvent{},
 	}
@@ -55,7 +57,7 @@ func (mw *MetadataWatcher) setup(refreshInterval time.Duration) (chan bool, erro
 				topics, err := mw.GetTopics()
 				added := false
 				if err != nil {
-					log.WithError(err).Warn("get topic error")
+					slog.Warn("get topic error", "err", err)
 					mw.emit(nil, err)
 					continue
 				}
@@ -73,7 +75,7 @@ func (mw *MetadataWatcher) setup(refreshInterval time.Duration) (chan bool, erro
 					}
 				}
 				if added {
-					log.Infof("topic changed: %v", topics)
+					slog.Info("topic changed", "topics", topics)
 					mw.emit(topics, nil)
 					mw.knownTopics = topics
 				}
@@ -120,19 +122,41 @@ func (mw *MetadataWatcher) RemoveListener(ch chan MetadataWatcherEvent) {
 
 // GetTopics lists all topics from kafka
 func (mw *MetadataWatcher) GetTopics() ([]string, error) {
-	metadata, err := mw.consumer.GetMetadata(nil, true, 5000)
-	if err != nil {
-		return nil, err
+	if len(mw.brokers) == 0 {
+		return nil, errors.New("no kafka brokers configured")
 	}
-	topics := make([]string, 0, len(metadata.Topics))
-	for _, t := range metadata.Topics {
-		topics = append(topics, t.Topic)
+	var lastErr error
+	for _, broker := range mw.brokers {
+		conn, err := kafka.Dial("tcp", broker)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		partitions, err := conn.ReadPartitions()
+		conn.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		topicsMap := map[string]struct{}{}
+		for _, partition := range partitions {
+			topicsMap[partition.Topic] = struct{}{}
+		}
+		topics := make([]string, 0, len(topicsMap))
+		for topic := range topicsMap {
+			topics = append(topics, topic)
+		}
+		sort.Strings(topics)
+		return topics, nil
 	}
-	return topics, nil
+	if lastErr == nil {
+		lastErr = errors.New("failed to connect to kafka brokers")
+	}
+	return nil, lastErr
 }
 
 // Disconnect closes the metadata watcher
 func (mw *MetadataWatcher) Disconnect() error {
 	mw.stopChan <- true
-	return mw.consumer.Close()
+	return nil
 }

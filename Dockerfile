@@ -1,19 +1,16 @@
-FROM ubuntu:20.04 as builder
+FROM golang:bookworm AS builder
 
 WORKDIR /app
-
-ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y ca-certificates golang-go librdkafka-dev
 
 COPY . .
-RUN GOOS=linux go build -a -o timburr .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o timburr .
 
-FROM ubuntu:20.04
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
 ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y ca-certificates librdkafka1 && \
+RUN apt-get update && apt-get install -y ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/timburr /app
