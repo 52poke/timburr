@@ -87,6 +87,7 @@ purge: # only needed to handle cache purging
   entries:
   - host: <mediawiki-host> # entry for purging page cache
     pathMatch: "^/wiki/" # only handle URLs with paths matching this regex (optional)
+    timeout: 2000 # request timeout in milliseconds (optional, defaults to 2000)
     method: PURGE # method to purge cache, see [libnginx-mod-http-cache-purge](https://packages.debian.org/buster/libnginx-mod-http-cache-purge) or [ngx_cache_purge](https://github.com/FRiCKLE/ngx_cache_purge) if nginx is used
     variants:
     - zh # only needed if cache keys contain language variants

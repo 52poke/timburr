@@ -28,6 +28,7 @@ type requestOptions struct {
 	method  string
 	url     string
 	headers map[string]string
+	timeout time.Duration
 }
 
 // DefaultPurgeExecutor creates a purge executor based on config.yml
@@ -54,7 +55,7 @@ func NewPurgeExecutor(expiry time.Duration, entries []utils.PurgeEntryConfig, cf
 		expiry:  expiry,
 		entries: entries,
 		client: &http.Client{
-			Timeout: time.Second * 2,
+			Timeout: 0,
 		},
 		cfAPI:    cfAPI,
 		cfZoneID: cfZoneID,
@@ -122,6 +123,10 @@ func (t *PurgeExecutor) handlePurge(ctx context.Context, item string, date time.
 			variants[variant] = true
 		}
 
+		timeout := 2 * time.Second
+		if entry.Timeout > 0 {
+			timeout = time.Duration(entry.Timeout) * time.Millisecond
+		}
 		for _, uri := range entry.URIs {
 			for variant := range variants {
 				if variant != "" && ((lastQuery != "" && variants[lastQuery]) ||
@@ -132,6 +137,7 @@ func (t *PurgeExecutor) handlePurge(ctx context.Context, item string, date time.
 					method:  entry.Method,
 					url:     strings.ReplaceAll(strings.ReplaceAll(uri, "#url#", u.RequestURI()), "#variants#", variant),
 					headers: entry.Headers,
+					timeout: timeout,
 				})
 
 				if firstPath == "wiki" && variant != "" {
@@ -139,6 +145,7 @@ func (t *PurgeExecutor) handlePurge(ctx context.Context, item string, date time.
 						method:  entry.Method,
 						url:     strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(uri, "#url#", u.RequestURI()), "#variants#", ""), "/wiki/", "/"+variant+"/"),
 						headers: entry.Headers,
+						timeout: timeout,
 					})
 				}
 			}
@@ -151,7 +158,7 @@ func (t *PurgeExecutor) handlePurge(ctx context.Context, item string, date time.
 	for _, ro := range ros {
 		ro := ro
 		eg.Go(func() error {
-			return t.doRequest(egCtx, ro.method, ro.url, ro.headers, item, dateStr)
+			return t.doRequest(egCtx, ro.method, ro.url, ro.headers, ro.timeout, item, dateStr)
 		})
 	}
 	if err := eg.Wait(); err != nil {
@@ -159,11 +166,11 @@ func (t *PurgeExecutor) handlePurge(ctx context.Context, item string, date time.
 	}
 }
 
-func (t *PurgeExecutor) doRequest(ctx context.Context, method, url string, headers map[string]string, rawURL, dateStr string) error {
+func (t *PurgeExecutor) doRequest(ctx context.Context, method, url string, headers map[string]string, timeout time.Duration, rawURL, dateStr string) error {
 	if strings.ToLower(method) == "cloudflare" {
-		return t.doCloudFlarePurge(ctx, url)
+		return t.doCloudFlarePurge(ctx, url, timeout)
 	}
-	ctx, cancel := context.WithTimeout(ctx, t.client.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, method, url, nil)
@@ -193,12 +200,12 @@ func (t *PurgeExecutor) doRequest(ctx context.Context, method, url string, heade
 	return nil
 }
 
-func (t *PurgeExecutor) doCloudFlarePurge(ctx context.Context, url string) error {
+func (t *PurgeExecutor) doCloudFlarePurge(ctx context.Context, url string, timeout time.Duration) error {
 	if t.cfAPI == nil {
 		slog.Warn("failed to purge cloudflare cache", "url", url)
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, t.client.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	resp, err := t.cfAPI.PurgeCache(ctx, t.cfZoneID, cloudflare.PurgeCacheRequest{
 		Files: []string{url},

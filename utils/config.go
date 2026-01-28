@@ -20,6 +20,7 @@ type RuleConfig struct {
 type PurgeEntryConfig struct {
 	Host      string            `yaml:"host"`
 	PathMatch string            `yaml:"pathMatch"`
+	Timeout   int64             `yaml:"timeout"`
 	Method    string            `yaml:"method"`
 	URIs      []string          `yaml:"uris"`
 	Headers   map[string]string `yaml:"headers"`
